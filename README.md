@@ -1,5 +1,7 @@
 # 基于pyqt的大模型对话框插件
 
+<img src="大模型对话框效果.gif" width="100%" height="100%"><br>
+
 ## ✨ 核心特性
 
 ### 🧩 对话体验
@@ -50,7 +52,3 @@
 ```bash
 pip install pyqt5 pygments markdown qfluentwidgets
 ```
-
-
-
-<img src="大模型对话框效果.gif" width="100%" height="100%"><br>
