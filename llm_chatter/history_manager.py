@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from pathlib import Path
 
+from app.utils.utils import serialize_for_json, deserialize_from_json
+
 
 class HistoryManager:
     def __init__(self, canvas_name: str):
@@ -17,7 +19,7 @@ class HistoryManager:
         if self.history_file.exists():
             try:
                 with open(self.history_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                    data = deserialize_from_json(json.load(f))
                     # 确保必要字段存在
                     for item in data:
                         if 'title' not in item:
@@ -49,9 +51,19 @@ class HistoryManager:
         })
         self._save_to_disk()
 
+    def get_current_title(self, index: int) -> str:
+        if 0 <= index < len(self._history_sessions):
+            return self._history_sessions[index]['title']
+        return ''
+
+    def update_session_title(self, index: int, new_title: str):
+        if 0 <= index < len(self._history_sessions):
+            self._history_sessions[index]['title'] = new_title
+            self._save_to_disk()
+
     def _save_to_disk(self):
         with open(self.history_file, 'w', encoding='utf-8') as f:
-            json.dump(self._history_sessions, f, ensure_ascii=False, indent=2)
+            json.dump(serialize_for_json(self._history_sessions), f, ensure_ascii=False, indent=2)
 
     def get_history_list(self) -> List[Dict]:
         return self._history_sessions

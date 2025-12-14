@@ -12,6 +12,8 @@ from qfluentwidgets import (
     CardWidget, CaptionLabel, BodyLabel
 )
 
+from app.utils.utils import serialize_for_json
+
 
 class ContextRegistry:
     # 注意：不再有 _instance，也不再是单例
@@ -191,7 +193,7 @@ class ContextSelector(QWidget):
         self.parent = parent
         self._selected_keys = set()
         self._context_items: List[Tuple[str, Callable]] = []
-        self._context_cache: Dict[str, Tuple[str, str, Callable]] = {}  # key -> (name, formatted_text, callback)
+        self._context_cache: Dict[str, Tuple[str, str, Callable], bool] = {}  # key -> (name, formatted_text, callback)
 
         self._refresh_context_items()
 
@@ -215,6 +217,7 @@ class ContextSelector(QWidget):
         main_layout.addStretch(1)
 
         self.refresh_btn = TransparentToolButton(FluentIcon.SYNC, self)
+        self.refresh_btn.setToolTip("刷新上下文")
         self.refresh_btn.setFixedSize(24, 24)
         self.refresh_btn.clicked.connect(self._update_tags)
         main_layout.addWidget(self.refresh_btn)
@@ -229,17 +232,52 @@ class ContextSelector(QWidget):
     def context(self):
         return self._context_cache
 
-    def get_all_context(self):
+    def get_multimodal_context_items(self) -> List[Dict[str, Any]]:
+        """
+        返回可用于多模态大模型的上下文项列表。
+        每项为 dict，可能包含 'text' 或 'image_url'
+        """
+        items = []
+        for key in sorted(self._selected_keys):
+            if key not in self._context_cache:
+                continue
+            name, context, _, is_image = self._context_cache[key]
+            if is_image:
+                # 多模态图片格式
+                if "text" in context:
+                    items.append({
+                        "type": "text",
+                        "text": f"# {name}信息:\n{context['text']}"
+                    })
+                items.append({
+                    "type": "image_url",
+                    "image_url": {"url": context["url"]}  # {"url": "data:image/..."}
+                })
+            else:
+                # 文本
+                items.append({
+                    "type": "text",
+                    "text": f"# {name}信息:\n{context}"
+                })
+        return items
+
+    def get_text_context(self):
         context = ("===== 画布上下文信息开始 =====\n\n" +
-                   "\n".join([context[1] for context in self._context_cache.values()]) +
+                   "\n".join([context[1] for context in self._context_cache.values() if not context[3]]) +
                    "\n===== 上下文信息结束 =====\n\n") if self._context_cache else ""
         return f"""# 角色
 你是低代码画布助手，主要工作：辅助分析画布内容、解答节点问题、帮忙推荐节点、设计画布流程；
 
+## 追问推荐规范
+- 操作类型:推荐追问,当你认为下一步用户会问哪些问题时,严格按照以下格式引用:
+[问题描述](ask)
+- 规范：放到回复最后，如果用户问题不清晰可以尝试重新描述问题。
+
 {context}
 
-请根据上下文信息，给出用户问题一个完整的回复。\n\n
-"""
+理解上下文信息，遵守上下文交互规范，并给出下面用户问题一个完整、调理清晰的语言进行回复。\n\n
+
+# 用户问题\n\n"""
 
     def get_context_by_key(self, key: str) -> str:
         """获取格式化后的上下文文本"""
@@ -250,7 +288,10 @@ class ContextSelector(QWidget):
         return self._context_cache.get(key, ("", "", lambda: None))[2]
 
     def _refresh_context_items(self):
-        self._context_items = self.parent.homepage.context_register.get_all_items()
+        if hasattr(self.parent.homepage, 'context_register'):
+            self._context_items = self.parent.homepage.context_register.get_all_items()
+        else:
+            self._context_items = []
 
     def _on_popup_selection_changed(self, selected: set):
         self._selected_keys = selected
@@ -273,7 +314,6 @@ class ContextSelector(QWidget):
         self.popup.show_at(popup_top_left)
 
     def _refresh_context_cache(self):
-        """预加载所有选中项的 (name, text, callback) 到缓存"""
         self._context_cache.clear()
         for context_key, context_func in self._context_items:
             if context_key in self._selected_keys:
@@ -283,13 +323,24 @@ class ContextSelector(QWidget):
                     logger.error(traceback.format_exc())
                     name, context_data, callback_params = "错误", f"[加载失败: {e}]", None
 
-                if isinstance(context_data, (dict, list, tuple, set)):
-                    context_str = json.dumps(context_data, indent=2, ensure_ascii=False)
-                else:
-                    context_str = str(context_data)
+                # ✅ 关键：保留原始数据结构，不做强制字符串化
+                # 判断是否是图片 dict
+                is_image = (
+                        isinstance(context_data, dict) and
+                        "url" in context_data and
+                        isinstance(context_data["url"], str) and
+                        context_data["url"].startswith("data:image/")
+                )
 
-                formatted_text = f"# {name}信息:\n{context_str}\n\n"
-                self._context_cache[context_key] = (name, formatted_text, callback_params)
+                if not is_image:
+                    # 普通文本：转为字符串
+                    if isinstance(context_data, (dict, list, tuple, set)):
+                        context_str = serialize_for_json(context_data)
+                    else:
+                        context_str = str(context_data)
+                    context_data = f"# {name}信息:\n{context_str}\n\n"
+
+                self._context_cache[context_key] = (name, context_data, callback_params, is_image)
 
     def _update_tags(self):
         self._refresh_context_cache()
@@ -316,7 +367,7 @@ class ContextSelector(QWidget):
             name = self._context_cache.get(key, ("未知", "", lambda: None))[0]
             tag = TagWidget(key, name)
             tag.closed.connect(self._on_tag_closed)
-            tag.doubleClicked.connect(self._on_tag_double_clicked)
+            tag.doubleClicked.connect(lambda k=key, t=tag: self._on_tag_double_clicked(k, t))
 
             tag_width = tag.sizeHint().width()
             if row_width + tag_width > max_row_width and row_width > 0:
@@ -346,12 +397,12 @@ class ContextSelector(QWidget):
                 self.popup.selected_keys = self._selected_keys.copy()
                 self.popup._update_checkboxes_from_selection()
 
-    def _on_tag_double_clicked(self, key: str):
+    def _on_tag_double_clicked(self, key: str, tag: TagWidget):
         """双击标签时，直接调用其回调函数"""
         callback = self.parent.homepage.context_register.get_executor(key)
         params = self.get_callback_params_by_key(key)
         if callable(callback):
             try:
-                callback(params)
+                callback(params, tag)
             except Exception as e:
                 print(f"[ContextSelector] 双击回调出错: {e}")

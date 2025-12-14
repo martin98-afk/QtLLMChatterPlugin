@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-from datetime import datetime
-from typing import Optional, Dict, Any
+import re
+from pathlib import Path
 
-from PyQt5.QtCore import Qt, QTimer
+from loguru import logger
+from typing import Optional, Dict, Any, List
+
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThreadPool
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QApplication, QWidget
 from qfluentwidgets import (
@@ -11,6 +14,7 @@ from qfluentwidgets import (
     TransparentToggleToolButton
 )
 
+from app.mcp_server.stdio_server import GlobalMcpServer
 from app.utils.config import Settings
 from app.utils.utils import get_icon
 from app.widgets.side_dock_area.plugins.llm_chatter.chat_session import SessionManager
@@ -18,8 +22,8 @@ from app.widgets.side_dock_area.plugins.llm_chatter.context_selector import Cont
 from app.widgets.side_dock_area.plugins.llm_chatter.history_manager import HistoryManager
 from app.widgets.side_dock_area.plugins.llm_chatter.llm_config_popup import LLMConfigPopup
 from app.widgets.side_dock_area.plugins.llm_chatter.message_card import MessageCard, create_welcome_card
-from app.widgets.side_dock_area.plugins.llm_chatter.text_browser import SendableTextEdit
-from app.widgets.side_dock_area.plugins.llm_chatter.worker import OpenAIChatWorker
+from app.widgets.side_dock_area.plugins.llm_chatter.bottom_input_area import SendableTextEdit
+from app.widgets.side_dock_area.plugins.llm_chatter.worker import OpenAIChatWorker, TitleGenerationTask
 from app.widgets.side_dock_area.tool_window import ToolWindow, DockPosition
 
 
@@ -36,9 +40,14 @@ class OpenAIChatToolWindow(ToolWindow):
     _settings_popup = None  # 懒加载
     _system_prompt = ""
     _is_welcome = False
+    insertResponse = pyqtSignal(str)
+    createResponse = pyqtSignal(str)
+    contextActionRequested = pyqtSignal(str, str)
+    _gen_thread_pool = QThreadPool()
 
     def __init__(self, homepage):
         super().__init__(homepage)
+        self._gen_thread_pool.setMaxThreadCount(2)  # 限制并发，避免 API 限流
         self.homepage = homepage
         self._worker: Optional[OpenAIChatWorker] = None
         self._is_streaming = False
@@ -62,31 +71,29 @@ class OpenAIChatToolWindow(ToolWindow):
         left_layout = QHBoxLayout()
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
-
-        model_label = QLabel("模型：", self)
-        setFont(model_label, 12, QFont.Bold)
-        model_label.setStyleSheet("color: #ffffff;")
-        left_layout.addWidget(model_label)
-
-        self.model_combo = ComboBox(self)
-        self._load_model_configs()
-        setFont(self.model_combo, 12)
-        left_layout.addWidget(self.model_combo)
-        left_layout.addStretch()
-        # 右侧保持不变
-        right_layout = QHBoxLayout()
-        # --- 新增：+ 新建对话 和 历史对话按钮 ---
         self.new_session_btn = TransparentToolButton(FluentIcon.ADD, self)
         self.new_session_btn.setToolTip("新建对话")
         self.new_session_btn.clicked.connect(self._create_new_session)
         self.history_btn = TransparentToggleToolButton(FluentIcon.HISTORY, self)
         self.history_btn.setToolTip("历史对话")
         self.history_btn.toggled.connect(self._toggle_history_mode)
+        left_layout.addWidget(self.new_session_btn)
+        left_layout.addWidget(self.history_btn)
+        left_layout.addStretch()
+        # 右侧保持不变
+        right_layout = QHBoxLayout()
+        model_label = QLabel("模型：", self)
+        setFont(model_label, 12, QFont.Bold)
+        model_label.setStyleSheet("color: #ffffff;")
+        right_layout.addWidget(model_label)
+
+        self.model_combo = ComboBox(self)
+        self._load_model_configs()
+        setFont(self.model_combo, 12)
+        right_layout.addWidget(self.model_combo)
         self.settings_btn = TransparentToolButton(FluentIcon.SETTING, self)
         self.settings_btn.setToolTip("模型设置")
         self.settings_btn.clicked.connect(self._open_settings_popup)
-        right_layout.addWidget(self.new_session_btn)
-        right_layout.addWidget(self.history_btn)
         right_layout.addWidget(self.settings_btn)
 
         session_bar_layout.addLayout(left_layout)
@@ -129,7 +136,7 @@ class OpenAIChatToolWindow(ToolWindow):
     def _open_settings_popup(self):
         # 懒加载 popup
         if self._settings_popup is None:
-            self._settings_popup = LLMConfigPopup(title=self.model_combo.currentText(), parent=self)
+            self._settings_popup = LLMConfigPopup(parent=self)
             self._settings_popup.configApplied.connect(self._on_config_applied)
 
         # 准备初始配置
@@ -142,17 +149,18 @@ class OpenAIChatToolWindow(ToolWindow):
                 "模型名称": setting.llm_model.value,
                 "API_KEY": setting.llm_api_key.value,
                 "API_URL": setting.llm_api_base.value,
-                "MaxTokens": setting.llm_max_tokens.value,
-                "Temperature": setting.llm_temperature.value,
+                "最大Token": setting.llm_max_tokens.value,
+                "温度": setting.llm_temperature.value,
+                "是否思考": setting.llm_enable_thinking.value,
             }
 
-        self._settings_popup.set_config(config)
+        self._settings_popup.set_config(self.model_combo.currentText(), config)
         # 在设置按钮下方弹出
         self._settings_popup.show_at(self.settings_btn)
 
     def _on_config_applied(self, new_config: dict):
         current_name = self.model_combo.currentText()
-        if hasattr(self.homepage, 'global_variables') and current_name in self.homepage.global_variables.custom:
+        if current_name != "系统默认配置":
             # 更新现有配置
             self.homepage.global_variables.custom[current_name].value = new_config
             self.homepage._on_global_variables_changed("custom", current_name, "update")
@@ -167,21 +175,34 @@ class OpenAIChatToolWindow(ToolWindow):
             setting.set(setting.llm_model, new_config["模型名称"])
             setting.set(setting.llm_api_key, new_config["API_KEY"])
             setting.set(setting.llm_api_base, new_config["API_URL"])
-            setting.set(setting.llm_max_tokens, new_config["MaxTokens"])
-            setting.set(setting.llm_temperature, new_config["Temperature"])
+            setting.set(setting.llm_max_tokens, new_config["最大Token"])
+            setting.set(setting.llm_temperature, new_config["温度"])
+            setting.set(setting.llm_enable_thinking, new_config["是否思考"])
             setting.save_config()
-            InfoBar.success("默认配置已更新", "已保存到系统配置。", parent=self, duration=1500)
-
-        self._load_model_configs()
+            self._load_model_configs()
+            InfoBar.success("系统默认配置已更新", "已保存到系统配置。", parent=self, duration=1500)
 
     def _load_model_configs(self):
-        # 保存当前选中的模型名（如果有的话）
         current_text = self.model_combo.currentText() if self.model_combo.count() > 0 else ""
 
         self._valid_configs.clear()
         self.model_combo.clear()
 
-        # 1. 尝试加载用户自定义配置
+        setting = Settings.get_instance()
+        default_config = {
+            "模型名称": setting.llm_model.value,
+            "API_KEY": setting.llm_api_key.value,
+            "API_URL": setting.llm_api_base.value,
+            "最大Token": setting.llm_max_tokens.value,
+            "温度": setting.llm_temperature.value,
+            "是否思考": setting.llm_enable_thinking.value,
+        }
+        self._valid_configs["系统默认配置"] = default_config
+
+        # 收集所有模型名称（系统 + 自定义）
+        all_model_names = ["系统默认配置"]
+
+        # 加载用户自定义配置
         try:
             custom_vars = getattr(self.homepage, 'global_variables', None)
             if custom_vars and hasattr(custom_vars, 'custom'):
@@ -189,37 +210,25 @@ class OpenAIChatToolWindow(ToolWindow):
                     if hasattr(var_obj, 'value') and isinstance(var_obj.value, dict):
                         val = var_obj.value
                         if {"API_URL", "API_KEY", "模型名称"}.issubset(val.keys()):
-                            self._valid_configs[config_name] = val
-            model_names = list(self._valid_configs.keys())
-            self.model_combo.addItems(model_names)
-            self.model_combo.setDisabled(False)
+                            # 避免自定义配置名与“系统默认配置”冲突
+                            if config_name != "系统默认配置":
+                                self._valid_configs[config_name] = val
+                                all_model_names.append(config_name)
         except Exception as e:
-            pass
+            # 建议至少打印错误
+            print(f"[ERROR] 加载自定义模型配置失败: {e}")
 
-        # 2. 如果没有自定义配置，使用默认配置
-        if not self._valid_configs:
-            setting = Settings.get_instance()
-            default_config = {
-                "模型名称": setting.llm_model.value,
-                "API_KEY": setting.llm_api_key.value,
-                "API_URL": setting.llm_api_base.value,
-                "MaxTokens": setting.llm_max_tokens.value,
-                "Temperature": setting.llm_temperature.value,
-            }
-            self._valid_configs["默认配置"] = default_config
-            self.model_combo.addItem("默认配置")
-            self.model_combo.setDisabled(False)  # 允许选择，哪怕只有一个
-            model_names = ["默认配置"]
+        # ✅ 关键：一次性添加所有模型名
+        self.model_combo.addItems(all_model_names)
+        self.model_combo.setDisabled(len(all_model_names) == 0)
 
-        # === 关键：恢复之前选中的模型名 ===
+        # 恢复之前选中的项
         if current_text in self._valid_configs:
             idx = self.model_combo.findText(current_text)
             if idx >= 0:
                 self.model_combo.setCurrentIndex(idx)
-        else:
-            # 如果之前选中的项不存在了，可以选第一个或保持空白（但 ComboBox 至少要有一个）
-            if self.model_combo.count() > 0:
-                self.model_combo.setCurrentIndex(0)
+        elif self.model_combo.count() > 0:
+            self.model_combo.setCurrentIndex(0)
 
     def _create_new_session(self):
         session = self.session_manager.create_new_session()
@@ -229,6 +238,7 @@ class OpenAIChatToolWindow(ToolWindow):
         # 创建欢迎卡片并标记
         welcome_card = create_welcome_card(self)
         welcome_card._is_welcome = True  # ← 关键标记
+        welcome_card.contextActionRequested.connect(self.handle_recommended_question)
         QTimer.singleShot(300, lambda: self.chat_layout.addWidget(welcome_card))
 
     def _display_current_session(self):
@@ -239,20 +249,13 @@ class OpenAIChatToolWindow(ToolWindow):
         if not session:
             return
         for msg in session.messages:
-            card = MessageCard(
-                parent=self,
-                role=msg["role"],
-                timestamp=msg.get("timestamp", datetime.now().strftime('%H:%M')),
-                tag_params=msg.get("params", {})
-            )
-            card.update_content(msg["content"])
-            card.finish_streaming()
-            card.deleteRequested.connect(lambda c=card: self._delete_message(c))
-            card.copyRequested.connect(self._copy_text)
-            if msg["role"] == "assistant":
-                card.regenerateRequested.connect(lambda c=card: self._regenerate_message(c))
-
-            self.chat_layout.addWidget(card)
+            if msg["role"] == "user":
+                self._append_user_message(msg["content"])
+            elif msg["role"] == "assistant":
+                card = self._append_assistant_message()
+                card.update_content(msg["content"])
+            else:
+                continue
 
         QTimer.singleShot(10, self._scroll_to_bottom)
 
@@ -305,7 +308,7 @@ class OpenAIChatToolWindow(ToolWindow):
         card = CardWidget(self)
 
         # 默认样式
-        base_style = "background-color: #2d2d2d; border-radius: 6px; padding: 8px;"
+        base_style = "background-color: #2d2d2d; border-radius: 6px; padding: 8px; background-color: transparent;"
         if is_current:
             # 橙色高亮（可按你偏好调整）
             card.setStyleSheet("background-color: #ff6f00; border-radius: 6px; padding: 8px; color: white;")
@@ -321,7 +324,7 @@ class OpenAIChatToolWindow(ToolWindow):
         title_label.setWordWrap(True)
         time_label = CaptionLabel(last_time, card)
         if is_current:
-            title_label.setStyleSheet("color: white; font-weight: bold;")
+            title_label.setStyleSheet("color: white; font-weight: bold; background-color: transparent;")
             time_label.setStyleSheet("color: rgba(255,255,255,0.8);")
         else:
             time_label.setStyleSheet("color: #aaa;")
@@ -330,7 +333,7 @@ class OpenAIChatToolWindow(ToolWindow):
         delete_btn.setFixedSize(24, 24)
         delete_btn.clicked.connect(lambda _, i=index: self._delete_history_session(i))
 
-        layout.addWidget(title_label, 1, Qt.AlignLeft)
+        layout.addWidget(title_label, 1)
         layout.addStretch()
         layout.addWidget(time_label)
         layout.addWidget(delete_btn)
@@ -368,14 +371,20 @@ class OpenAIChatToolWindow(ToolWindow):
         card.update_content(content)
         card.finish_streaming()
         card.deleteRequested.connect(lambda: self._delete_message(card))
-        card.copyRequested.connect(self._copy_text)
+        card.actionRequested.connect(self._on_code_action)
         self.chat_layout.addWidget(card)
         self._scroll_to_bottom()
+        return card
 
     def _append_assistant_message(self) -> MessageCard:
         card = MessageCard(parent=self, role="assistant")
-        card.copyRequested.connect(self._copy_text)
+        card.actionRequested.connect(self._on_code_action)
         card.regenerateRequested.connect(lambda: self._regenerate_message(card))
+        card.contextActionRequested.connect(self.handle_recommended_question)
+        if hasattr(self.homepage, "on_context_action"):
+            card.contextActionRequested.connect(self.homepage.on_context_action)
+        else:
+            card.contextActionRequested.connect(self.contextActionRequested.emit)
         self.chat_layout.addWidget(card)
         self._scroll_to_bottom()
         return card
@@ -448,23 +457,60 @@ class OpenAIChatToolWindow(ToolWindow):
         user_input = session.messages[card_index - 1]["content"]
         params = session.messages[card_index - 1]["params"]
         if params:
-            user_input = "\n".join([value[1] for value in params.values()]) + "\n\n" + user_input
+            user_input = "\n".join([value[1] for value in params.values()]) + "\n\n" + user_input + "\n\n回复内容:\n"
         # 删除当前助手消息
         self._delete_message(card)
         # 重新发送
-        self.input_area._on_send_click()
         self._on_send_clicked(user_input)
 
-    def _copy_text(self, text: str):
-        clipboard = QApplication.clipboard()
-        clipboard.setText(text)
+    def _on_code_action(self, code: str, action: str="copy"):
+        """统一处理代码块操作：插入、新建、复制等"""
+        if action == "insert":
+            self.insertResponse.emit(code)  # 如果需要向上转发
+        elif action == "create":
+            self.createResponse.emit(code)
+        elif action == "copy":
+            clipboard = QApplication.clipboard()
+            clipboard.setText(code)
 
     def _scroll_to_bottom(self):
         QTimer.singleShot(10, lambda: self.chat_scroll_area.verticalScrollBar().setValue(
             self.chat_scroll_area.verticalScrollBar().maximum()
         ))
 
+    def handle_recommended_question(self, content: str, action: str):
+        if action == "ask":
+            session = self.session_manager.get_current_session()
+            session.add_user_message(
+                content=content,
+                params={key: value for key, value in self.context_selector.context.items()}
+            )
+            self.input_area.clear()
+            self._append_user_message(content)
+            self.send_preset_question(content)
+
+    def send_preset_question(self, question: str):
+        """
+        从外部传入一个预制问题并自动开始生成回复。
+
+        Args:
+            question (str): 预设的用户提问内容
+        """
+        if not isinstance(question, str) or not question.strip():
+            return
+
+        # 如果处于历史模式，退出历史模式并回到当前会话
+        if self._in_history_mode:
+            self.history_btn.setChecked(False)
+            self._toggle_history_mode(False)
+        # 触发标准发送流程（复用已有逻辑）
+        self._on_send_clicked(user_text=question.strip())
+
     def _on_send_clicked(self, user_text: str = ""):
+        # === 防止重复发送：自动中止当前请求 ===
+        if self._is_streaming:
+            self._on_stop_clicked()  # 安全中止当前 worker
+        self.input_area.toggle_send_button(False)
         # === 安全移除欢迎卡片（动态查找）===
         welcome_card = None
         for i in range(self.chat_layout.count()):
@@ -472,12 +518,11 @@ class OpenAIChatToolWindow(ToolWindow):
             if isinstance(widget, MessageCard) and getattr(widget, '_is_welcome', False):
                 welcome_card = widget
                 break
-
         if welcome_card is not None:
             self.chat_layout.removeWidget(welcome_card)
             welcome_card.deleteLater()
 
-        # === 原有发送逻辑 ===
+        # === 原有发送逻辑继续 ===
         session = self.session_manager.get_current_session()
         if not user_text:
             user_text = self.input_area.toPlainText().strip()
@@ -489,29 +534,58 @@ class OpenAIChatToolWindow(ToolWindow):
             )
             self.input_area.clear()
             self._append_user_message(user_text)
-            enhanced_input = self.context_selector.get_all_context() + user_text
-        else:
-            enhanced_input = user_text
 
-        assistant_card = self._append_assistant_message()
         selected_name = self.model_combo.currentText()
         llm_config = self._valid_configs.get(selected_name)
+        assistant_card = self._append_assistant_message()
         if not llm_config:
             self._update_assistant_message(assistant_card, "[错误] 模型配置无效")
             return
 
+        # 构建系统消息
         messages = []
-        system_prompt = self._system_prompt + llm_config.get("系统提示", "").strip()
+        system_prompt = (self._system_prompt + llm_config.get("系统提示", "").strip()).strip()
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
+        # 添加历史消息（注意：历史消息必须是纯文本，不能含 image_url）
         for msg in session.messages[:-1]:
-            messages.append(msg)
+            # 历史消息只保留文本，丢弃图片（或你也可设计历史支持图片，但需更复杂处理）
+            if isinstance(msg["content"], list):
+                # 如果历史中已有多模态，只取 text 部分（简化处理）
+                text_parts = [item["text"] for item in msg["content"] if item["type"] == "text"]
+                content = "\n".join(text_parts)
+            else:
+                content = msg["content"]
+            messages.append({"role": msg["role"], "content": content})
 
-        messages.append({"role": "user", "content": enhanced_input})
+        # 当前用户消息：多模态
+        model_name = llm_config.get("模型名称", "")
+        supports_vision = any(
+            m in model_name.lower() for m in ["4o", "4-turbo", "gpt-4-v", "vision", "vl", "glm-4v", "qwen-vl"])
+
+        if supports_vision:
+            context_items = self.context_selector.get_multimodal_context_items()
+            user_content_list = []
+            for item in context_items:
+                user_content_list.append(item)
+            user_content_list.append({"type": "text", "text": user_text})
+            # 使用多模态格式
+            messages.append({"role": "user", "content": user_content_list})
+        else:
+            # 回退到纯文本
+            context_text = self.context_selector.get_text_context()
+            messages.append({"role": "user", "content": context_text + user_text})
 
         self._is_streaming = True
-        self._worker = OpenAIChatWorker(messages=messages, llm_config=llm_config)
+        # 在 _on_send_clicked 中，构建 messages 之后、创建 worker 之前，加入：
+        available_tools = self._get_available_mcp_tools()  # ← 新方法
+
+        self._worker = OpenAIChatWorker(
+            messages=messages,
+            llm_config=llm_config,
+            tools=available_tools  # ← 传入 tools
+        )
         self._worker.content_received.connect(lambda c: self._on_content_received(c, assistant_card))
         self._worker.error_occurred.connect(lambda e: self._on_error(e, assistant_card))
         self._worker.finished_with_content.connect(lambda r: self._on_worker_finished(r, assistant_card))
@@ -520,19 +594,22 @@ class OpenAIChatToolWindow(ToolWindow):
         self._toggle_send_stop(True)
 
     def _on_error(self, error: str, card: MessageCard):
+        card.update_content(error)
         self._is_streaming = False
         self._toggle_send_stop(False)
+        self.input_area.toggle_send_button(True)
 
     def _on_worker_finished(self, response: str, card: MessageCard):
         self._is_streaming = False
         card.finish_streaming()
-        self.input_area._on_stop_click()
+        self.input_area.toggle_send_button(True)
         self._toggle_send_stop(False)
         session = self.session_manager.get_current_session()
         if session:
             session.add_assistant_message(content=response)
             # ✅ 自动保存当前会话到历史
-            self._auto_save_current_session()
+            current_title = self._auto_save_current_session()
+            # self._generate_conversation_title(current_title, session.messages)
 
     def _auto_save_current_session(self):
         """根据当前状态决定保存方式"""
@@ -549,6 +626,8 @@ class OpenAIChatToolWindow(ToolWindow):
             # 保存后，自动绑定到新历史索引（避免重复保存）
             self._current_history_index = 0  # 因为 save_session 是 insert(0, ...)
 
+        return self.history_manager.get_current_title(self._current_history_index)
+
     def _toggle_send_stop(self, is_sending: bool):
         if is_sending:
             self.model_combo.setDisabled(True)
@@ -560,18 +639,68 @@ class OpenAIChatToolWindow(ToolWindow):
     def _on_stop_clicked(self):
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
-            self._worker = None
-            self._is_streaming = False
-            self._toggle_send_stop(False)
-            InfoBar.warning(
-                title='已中止',
-                content="问答请求已被手动中止。",
-                orient=Qt.Horizontal,
-                isClosable=True,
-                position=InfoBarPosition.TOP_RIGHT,
-                duration=2000,
-                parent=self
-            )
+            self._worker = None  # 可选：等待线程真正结束（避免 race condition）
+        self._worker = None
+        self._is_streaming = False
+        self._toggle_send_stop(False)
+        self.input_area.toggle_send_button(True)
+        InfoBar.warning(
+            title='已中止',
+            content="问答请求已被手动中止。",
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=2000,
+            parent=self
+        )
 
     def _on_content_received(self, content_piece: str, assistant_card: MessageCard):
         self._update_assistant_message(assistant_card, content_piece)
+
+    # 对话标题总结
+    def _generate_conversation_title(self, current_title: str, messages: List[Dict]):
+        """异步请求大模型生成对话标题"""
+        if len(messages) < 2:
+            return
+
+        selected_name = self.model_combo.currentText()
+        llm_config = self._valid_configs.get(selected_name)
+        if not llm_config:
+            return
+
+        # 创建任务
+        task = TitleGenerationTask(
+            current_title=current_title,
+            messages_for_summary=messages,
+            llm_config=llm_config,
+            callback=self._on_title_generated  # 用于回调
+        )
+        self._gen_thread_pool.start(task)
+
+    def _on_title_generated(self, raw_output: str, error_msg: str = None):
+        """从模型输出中提取 ```title ... ``` 中的标题"""
+        if not raw_output:
+            return
+
+        # 正则匹配：支持跨行，非贪婪
+        match = re.search(r"```title\s*(.+?)\s*```", raw_output, re.DOTALL)
+        if match:
+            title = match.group(1).strip()
+            # 进一步清理：去除可能的引号、多余空格
+            title = title.strip("\"'“”‘’ \n\t")
+            # 限制长度（防止模型不听话）
+            if 1 <= len(title) <= 15:
+                if self._current_history_index is not None:
+                    self.history_manager.update_session_title(self._current_history_index, title)
+                    if self._in_history_mode:
+                        self._display_history_sessions()
+                return
+
+        # 若提取失败，可选择不更新（保持默认标题）
+        logger.error(f"[Title Gen] 未能从以下输出中提取标题:\n{raw_output}")
+
+    def _get_available_mcp_tools(self) -> List[Dict]:
+        """从 MCP 服务器或注册表中获取当前可用的工具定义"""
+        exports_dir = Path(r"D:\work\CanvasMind\canvas_files\projects")
+        server = GlobalMcpServer(exports_dir)
+        return server.handle_initialize(None)
